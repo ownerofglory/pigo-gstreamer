@@ -1,18 +1,13 @@
 package main
 
-import "C"
-
 import (
 	"bufio"
-	"context"
+	"errors"
 	"flag"
 	"io"
 	"log"
 	"os"
-	"os/exec"
-	"os/signal"
 	"runtime"
-	"syscall"
 	"time"
 
 	pigo "github.com/esimov/pigo/core"
@@ -23,7 +18,6 @@ var (
 	cascade    []byte
 )
 
-// loadCascade loads and unpacks the Pigo cascade file.
 func loadCascade(path string) *pigo.Pigo {
 	if len(cascade) != 0 && classifier != nil {
 		return classifier
@@ -43,7 +37,6 @@ func loadCascade(path string) *pigo.Pigo {
 	return classifier
 }
 
-// detectFaces runs Pigo on a grayscale frame and returns detections.
 func detectFaces(classifier *pigo.Pigo, pixels []uint8, rows, cols int) []pigo.Detection {
 	cParams := pigo.CascadeParams{
 		MinSize:     100,
@@ -57,157 +50,133 @@ func detectFaces(classifier *pigo.Pigo, pixels []uint8, rows, cols int) []pigo.D
 			Dim:    cols,
 		},
 	}
-
 	dets := classifier.RunCascade(cParams, 0.0)
 	dets = classifier.ClusterDetections(dets, 0.0)
 	return dets
 }
 
-// startGst starts a gst-launch-1.0 pipeline and returns cmd + stdout reader.
-func startGst(ctx context.Context, pipeline string) (*exec.Cmd, io.ReadCloser, error) {
-	args := append([]string{"-e"}, splitArgs(pipeline)...)
-	cmd := exec.CommandContext(ctx, "gst-launch-1.0", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, nil, err
+// clamp 0..255
+func clamp(v int) uint8 {
+	if v < 0 {
+		return 0
 	}
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		_ = stdout.Close()
-		return nil, nil, err
+	if v > 255 {
+		return 255
 	}
-	log.Printf("Started gst-launch-1.0 with args: %v", cmd.Args)
-	return cmd, stdout, nil
+	return uint8(v)
 }
 
-// splitArgs is a minimal whitespace splitter (no full shell parsing).
-func splitArgs(s string) []string {
-	var args []string
-	current := ""
-	inQuotes := false
+// drawBoxGray draws a rectangle on a GRAY8 buffer.
+func drawBoxGray(buf []byte, width, height int, cx, cy, radius int) {
+	x0 := cx - radius
+	y0 := cy - radius
+	x1 := cx + radius
+	y1 := cy + radius
 
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
-		case ' ':
-			if inQuotes {
-				current += string(ch)
-			} else if current != "" {
-				args = append(args, current)
-				current = ""
-			}
-		case '"':
-			inQuotes = !inQuotes
-		default:
-			current += string(ch)
-		}
+	if x0 < 0 {
+		x0 = 0
 	}
-	if current != "" {
-		args = append(args, current)
+	if y0 < 0 {
+		y0 = 0
 	}
-	return args
+	if x1 >= width {
+		x1 = width - 1
+	}
+	if y1 >= height {
+		y1 = height - 1
+	}
+
+	// top & bottom
+	for x := x0; x <= x1; x++ {
+		iTop := y0*width + x
+		iBot := y1*width + x
+		buf[iTop] = clamp(int(buf[iTop]) + 80)
+		buf[iBot] = clamp(int(buf[iBot]) + 80)
+	}
+
+	// left & right
+	for y := y0; y <= y1; y++ {
+		iL := y*width + x0
+		iR := y*width + x1
+		buf[iL] = clamp(int(buf[iL]) + 80)
+		buf[iR] = clamp(int(buf[iR]) + 80)
+	}
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	log.SetOutput(os.Stderr)
 
-	// --- Flags ---
 	width := flag.Int("width", 640, "frame width (pixels)")
 	height := flag.Int("height", 480, "frame height (pixels)")
 	cascadePath := flag.String("cascade", "cascade/facefinder", "path to Pigo cascade file")
-
-	// for macOS webcam:
-	//   avfvideosrc device-index=0 ! videoconvert ! videoscale !
-	//   video/x-raw,format=GRAY8,width=640,height=480,framerate=30/1 ! fdsink fd=1 sync=false
-	//
-	//  for RTP/H264:
-	//   udpsrc port=5000 caps="application/x-rtp, media=video, encoding-name=H264, payload=96" !
-	//   rtph264depay ! h264parse ! avdec_h264 !
-	//   videoconvert ! videoscale !
-	//   video/x-raw,format=GRAY8,width=640,height=480,framerate=30/1 ! fdsink fd=1 sync=false
-	pipeline := flag.String("pipeline", "", "GStreamer pipeline (ending in GRAY8 video/x-raw to fdsink fd=1)")
 	minScore := flag.Float64("min-score", 5.0, "minimum detection score (Q) to report")
-
 	flag.Parse()
 
-	if *pipeline == "" {
-		log.Fatal("You must pass -pipeline with a valid GStreamer pipeline")
+	if *width <= 0 || *height <= 0 {
+		log.Fatal("width and height must be > 0")
 	}
 
-	// --- Context + signals ---
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		log.Println("Received signal, shutting down...")
-		cancel()
-	}()
-
-	// --- Load Pigo cascade ---
 	clf := loadCascade(*cascadePath)
 	log.Println("Loaded Pigo cascade from", *cascadePath)
 
-	// --- Start GStreamer pipeline ---
-	cmd, stdout, err := startGst(ctx, *pipeline)
-	if err != nil {
-		log.Fatalf("failed to start GStreamer: %v", err)
-	}
-	defer func() {
-		_ = stdout.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	}()
-
-	reader := bufio.NewReader(stdout)
-
-	frameSize := (*width) * (*height) // GRAY8: 1 byte per pixel
+	frameSize := (*width) * (*height)
 	buf := make([]byte, frameSize)
 
-	log.Printf("Expecting GRAY8 frames of %dx%d (%d bytes)\n", *width, *height, frameSize)
+	r := bufio.NewReader(os.Stdin)
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+
+	log.Printf("Pigo filter: expecting GRAY8 frames of %dx%d (%d bytes)\n",
+		*width, *height, frameSize)
 
 	frameCount := 0
-	startTime := time.Now()
+	start := time.Now()
 
 	for {
-		if ctx.Err() != nil {
-			log.Println("Context canceled, stopping main loop")
-			break
-		}
-
-		_, err := io.ReadFull(reader, buf)
+		n, err := io.ReadFull(r, buf)
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				log.Println("GStreamer pipeline ended")
-				break
+			if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
+				log.Println("EOF on stdin, exiting")
+				return
 			}
-			log.Fatalf("error reading frame from GStreamer: %v", err)
+			log.Fatalf("read error: %v", err)
+		}
+		if n != frameSize {
+			log.Fatalf("short read: got %d, expected %d", n, frameSize)
 		}
 
 		frameCount++
 
-		// Detect faces
+		// Run Pigo
 		dets := detectFaces(clf, buf, *height, *width)
-
 		for _, det := range dets {
 			if det.Q >= float32(*minScore) {
-				// Pigo returns Row, Col, Scale, Q
 				log.Printf("frame=%d face row=%d col=%d scale=%d q=%.2f",
 					frameCount, det.Row, det.Col, det.Scale, det.Q)
+
+				// Draw into the buffer (so it shows up in the video)
+				radius := det.Scale / 2
+				drawBoxGray(buf, *width, *height, det.Col, det.Row, radius)
 			}
 		}
 
-		// Simple FPS report every 60 frames
+		// write modified frame to stdout
+		m, err := w.Write(buf)
+		if err != nil {
+			log.Fatalf("write error: %v", err)
+		}
+		if m != frameSize {
+			log.Fatalf("short write: wrote %d, expected %d", m, frameSize)
+		}
+		if err := w.Flush(); err != nil {
+			log.Fatalf("flush error: %v", err)
+		}
+
 		if frameCount%60 == 0 {
-			elapsed := time.Since(startTime).Seconds()
+			elapsed := time.Since(start).Seconds()
 			fps := float64(frameCount) / elapsed
 			log.Printf("Processed %d frames (%.1f FPS)", frameCount, fps)
 		}
 	}
-
-	log.Println("Exiting.")
 }
